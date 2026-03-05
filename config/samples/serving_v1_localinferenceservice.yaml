@@ -1,0 +1,9 @@
+apiVersion: serving.local-ome.com/v1
+kind: LocalInferenceService
+metadata:
+  labels:
+    app.kubernetes.io/name: local-ome
+    app.kubernetes.io/managed-by: kustomize
+  name: localinferenceservice-sample
+spec:
+  # TODO(user): Add fields here

@@ -1,0 +1,16 @@
+apiVersion: serving.local-ome.com/v1
+kind: LocalInferenceService
+metadata:
+  name: test-inference
+  namespace: default
+spec:
+  runtime: vllm
+  model:
+    uri: "hf://facebook/opt-125m"
+    name: "OPT 125M"
+  settings:
+    batchSize: 1
+    precision: fp16
+    maxTokens: 100
+  scaling:
+    replicas: 1
