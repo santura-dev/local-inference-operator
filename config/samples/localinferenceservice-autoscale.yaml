@@ -1,0 +1,18 @@
+apiVersion: serving.local-ome.com/v1
+kind: LocalInferenceService
+metadata:
+  name: phi-autoscale-example
+spec:
+  runtime: sglang
+  model:
+    uri: "hf://microsoft/phi-1_5"
+    name: "phi-1_5"
+  settings:
+    batchSize: 4
+    precision: "fp16"
+    maxTokens: 100
+  scaling:
+    replicas: 1
+    autoScale: true
+    minReplicas: 1
+    maxReplicas: 5

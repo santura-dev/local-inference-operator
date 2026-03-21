@@ -22,6 +22,7 @@ import (
 	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
+	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -46,6 +47,7 @@ type LocalInferenceServiceReconciler struct {
 // +kubebuilder:rbac:groups=serving.local-ome.com,resources=localinferenceservices/finalizers,verbs=update
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=services,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=autoscaling,resources=horizontalpodautoscalers,verbs=get;list;watch;create;update;patch;delete
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
@@ -92,6 +94,15 @@ func (r *LocalInferenceServiceReconciler) Reconcile(ctx context.Context, req ctr
 	if err := r.ensureService(ctx, &lis, serviceName, deploymentName); err != nil {
 		log.Error(err, "Failed to ensure Service")
 		return ctrl.Result{}, err
+	}
+
+	// Create or update HPA if auto-scaling is enabled
+	if lis.Spec.Scaling.AutoScale {
+		hpaName := fmt.Sprintf("%s-hpa", lis.Name)
+		if err := r.ensureHPA(ctx, &lis, hpaName, deploymentName); err != nil {
+			log.Error(err, "Failed to ensure HPA")
+			return ctrl.Result{}, err
+		}
 	}
 
 	// Update status
@@ -227,6 +238,52 @@ func (r *LocalInferenceServiceReconciler) ensureDeployment(ctx context.Context, 
 				return err
 			}
 			existing.Spec = dep.Spec
+			return r.Update(ctx, existing)
+		}
+		return err
+	}
+	return nil
+}
+
+// ensureHPA creates or updates the HorizontalPodAutoscaler for auto-scaling
+func (r *LocalInferenceServiceReconciler) ensureHPA(ctx context.Context, lis *servingv1.LocalInferenceService, name, deploymentName string) error {
+	defaultCPUUtilization := int32(70)
+
+	hpa := &autoscalingv2.HorizontalPodAutoscaler{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: lis.Namespace,
+		},
+		Spec: autoscalingv2.HorizontalPodAutoscalerSpec{
+			ScaleTargetRef: autoscalingv2.CrossVersionObjectReference{
+				APIVersion: "apps/v1",
+				Kind:       "Deployment",
+				Name:       deploymentName,
+			},
+			MinReplicas: &lis.Spec.Scaling.MinReplicas,
+			MaxReplicas: lis.Spec.Scaling.MaxReplicas,
+			Metrics: []autoscalingv2.MetricSpec{
+				{
+					Type: autoscalingv2.ResourceMetricSourceType,
+					Resource: &autoscalingv2.ResourceMetricSource{
+						Name: corev1.ResourceCPU,
+						Target: autoscalingv2.MetricTarget{
+							Type:               autoscalingv2.UtilizationMetricType,
+							AverageUtilization: &defaultCPUUtilization,
+						},
+					},
+				},
+			},
+		},
+	}
+
+	if err := r.Create(ctx, hpa); err != nil {
+		if errors.IsAlreadyExists(err) {
+			existing := &autoscalingv2.HorizontalPodAutoscaler{}
+			if err := r.Get(ctx, client.ObjectKeyFromObject(hpa), existing); err != nil {
+				return err
+			}
+			existing.Spec = hpa.Spec
 			return r.Update(ctx, existing)
 		}
 		return err
