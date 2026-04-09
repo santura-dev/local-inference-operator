@@ -1,18 +1,5 @@
-/*
-Copyright 2025.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+// Copyright 2025 Sandra Poturalska
+// SPDX-License-Identifier: MIT
 
 package controller
 
@@ -21,13 +8,15 @@ import (
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
-	"k8s.io/apimachinery/pkg/api/errors"
+
+	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-
-	servingv1 "local-ome/api/v1"
+	servingv1 "github.com/santura-dev/local-inference-operator/api/v1"
 )
 
 var _ = Describe("LocalInferenceService Controller", func() {
@@ -38,36 +27,44 @@ var _ = Describe("LocalInferenceService Controller", func() {
 
 		typeNamespacedName := types.NamespacedName{
 			Name:      resourceName,
-			Namespace: "default", // TODO(user):Modify as needed
+			Namespace: "default",
 		}
-		localinferenceservice := &servingv1.LocalInferenceService{}
 
 		BeforeEach(func() {
-			By("creating the custom resource for the Kind LocalInferenceService")
-			err := k8sClient.Get(ctx, typeNamespacedName, localinferenceservice)
-			if err != nil && errors.IsNotFound(err) {
-				resource := &servingv1.LocalInferenceService{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:      resourceName,
-						Namespace: "default",
+			resource := &servingv1.LocalInferenceService{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      resourceName,
+					Namespace: "default",
+				},
+				Spec: servingv1.LocalInferenceServiceSpec{
+					Runtime: "vllm",
+					Model: servingv1.ModelSpec{
+						URI:  "hf://facebook/opt-125m",
+						Name: "OPT 125M",
 					},
-					// TODO(user): Specify other spec details if needed.
-				}
-				Expect(k8sClient.Create(ctx, resource)).To(Succeed())
+					Settings: servingv1.SettingsSpec{
+						Precision: "fp16",
+						BatchSize: 1,
+						MaxTokens: 100,
+					},
+					Scaling: servingv1.ScalingSpec{Replicas: 1},
+				},
+			}
+			err := k8sClient.Create(ctx, resource)
+			if err != nil && !apierrors.IsAlreadyExists(err) {
+				Expect(err).NotTo(HaveOccurred())
 			}
 		})
 
 		AfterEach(func() {
-			// TODO(user): Cleanup logic after each test, like removing the resource instance.
 			resource := &servingv1.LocalInferenceService{}
 			err := k8sClient.Get(ctx, typeNamespacedName, resource)
-			Expect(err).NotTo(HaveOccurred())
-
-			By("Cleanup the specific resource instance LocalInferenceService")
-			Expect(k8sClient.Delete(ctx, resource)).To(Succeed())
+			if err == nil {
+				Expect(k8sClient.Delete(ctx, resource)).To(Succeed())
+			}
 		})
-		It("should successfully reconcile the resource", func() {
-			By("Reconciling the created resource")
+
+		It("creates an owned Deployment and Service with health probes", func() {
 			controllerReconciler := &LocalInferenceServiceReconciler{
 				Client: k8sClient,
 				Scheme: k8sClient.Scheme(),
@@ -77,8 +74,46 @@ var _ = Describe("LocalInferenceService Controller", func() {
 				NamespacedName: typeNamespacedName,
 			})
 			Expect(err).NotTo(HaveOccurred())
-			// TODO(user): Add more specific assertions depending on your controller's reconciliation logic.
-			// Example: If you expect a certain status condition after reconciliation, verify it here.
+
+			deployment := &appsv1.Deployment{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{
+				Name:      resourceName + "-deployment",
+				Namespace: "default",
+			}, deployment)).To(Succeed())
+
+			Expect(deployment.OwnerReferences).To(HaveLen(1))
+			Expect(deployment.OwnerReferences[0].Kind).To(Equal("LocalInferenceService"))
+			Expect(deployment.Spec.Template.Spec.Containers).To(HaveLen(1))
+
+			container := deployment.Spec.Template.Spec.Containers[0]
+			Expect(container.ReadinessProbe).NotTo(BeNil())
+			Expect(container.ReadinessProbe.HTTPGet.Path).To(Equal("/health"))
+			Expect(container.LivenessProbe).NotTo(BeNil())
+
+			service := &corev1.Service{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{
+				Name:      resourceName + "-service",
+				Namespace: "default",
+			}, service)).To(Succeed())
+			Expect(service.OwnerReferences).To(HaveLen(1))
+		})
+
+		It("reports a status phase based on the Deployment state", func() {
+			controllerReconciler := &LocalInferenceServiceReconciler{
+				Client: k8sClient,
+				Scheme: k8sClient.Scheme(),
+			}
+
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: typeNamespacedName,
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			updated := &servingv1.LocalInferenceService{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, updated)).To(Succeed())
+			Expect(updated.Status.Phase).To(Equal("Progressing"))
+			Expect(updated.Status.DeploymentName).To(Equal(resourceName + "-deployment"))
+			Expect(updated.Status.Conditions).NotTo(BeEmpty())
 		})
 	})
 })

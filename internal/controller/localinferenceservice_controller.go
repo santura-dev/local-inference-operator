@@ -1,39 +1,38 @@
-/*
-Copyright 2025.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+// Copyright 2025 Sandra Poturalska
+// SPDX-License-Identifier: MIT
 
 package controller
 
 import (
 	"context"
 	"fmt"
+	"os"
 	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
 	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/errors"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
-	servingv1 "local-ome/api/v1"
+	servingv1 "github.com/santura-dev/local-inference-operator/api/v1"
+)
+
+const (
+	inferencePort   = int32(8000)
+	gpuResourceName = "nvidia.com/gpu"
+
+	defaultVLLMImage   = "vllm/vllm-openai:latest"
+	defaultSGLangImage = "lmsysorg/sglang:latest"
 )
 
 // LocalInferenceServiceReconciler reconciles a LocalInferenceService object
@@ -49,122 +48,100 @@ type LocalInferenceServiceReconciler struct {
 // +kubebuilder:rbac:groups=core,resources=services,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=autoscaling,resources=horizontalpodautoscalers,verbs=get;list;watch;create;update;patch;delete
 
-// Reconcile is part of the main kubernetes reconciliation loop which aims to
-// move the current state of the cluster closer to the desired state.
-// The Reconcile function compares the state specified by the LocalInferenceService
-// object against the actual cluster state, and performs operations to make the
-// cluster state reflect the desired state.
-//
-// For more details, check Reconcile and its Result here:
-// - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.22.4/pkg/reconcile
 func (r *LocalInferenceServiceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 
-	// Fetch the LocalInferenceService instance
 	var lis servingv1.LocalInferenceService
 	if err := r.Get(ctx, req.NamespacedName, &lis); err != nil {
-		if errors.IsNotFound(err) {
-			// Request object not found, could have been deleted after reconcile request.
-			// Owned objects are automatically garbage collected. For additional cleanup logic use finalizers.
-			// Return and don't requeue
+		if apierrors.IsNotFound(err) {
 			log.Info("LocalInferenceService resource not found. Ignoring since object must be deleted")
 			return ctrl.Result{}, nil
 		}
-		// Error reading the object - requeue the request.
 		log.Error(err, "Failed to get LocalInferenceService")
 		return ctrl.Result{}, err
 	}
 
-	// Determine the container image based on runtime
-	image := r.getImageForRuntime(lis.Spec.Runtime)
-
-	// Prepare environment variables from spec
-	envVars := r.buildEnvVars(&lis.Spec)
-
-	// Create or update the Deployment
 	deploymentName := fmt.Sprintf("%s-deployment", lis.Name)
 	serviceName := fmt.Sprintf("%s-service", lis.Name)
+	hpaName := fmt.Sprintf("%s-hpa", lis.Name)
 
-	if err := r.ensureDeployment(ctx, &lis, deploymentName, image, envVars); err != nil {
+	if err := r.ensureDeployment(ctx, &lis, deploymentName); err != nil {
 		log.Error(err, "Failed to ensure Deployment")
 		return ctrl.Result{}, err
 	}
 
-	// Create or update the Service
-	if err := r.ensureService(ctx, &lis, serviceName, deploymentName); err != nil {
+	if err := r.ensureService(ctx, &lis, serviceName); err != nil {
 		log.Error(err, "Failed to ensure Service")
 		return ctrl.Result{}, err
 	}
 
-	// Create or update HPA if auto-scaling is enabled
 	if lis.Spec.Scaling.AutoScale {
-		hpaName := fmt.Sprintf("%s-hpa", lis.Name)
 		if err := r.ensureHPA(ctx, &lis, hpaName, deploymentName); err != nil {
 			log.Error(err, "Failed to ensure HPA")
 			return ctrl.Result{}, err
 		}
+	} else if err := r.deleteHPAIfPresent(ctx, hpaName, lis.Namespace); err != nil {
+		log.Error(err, "Failed to remove HPA")
+		return ctrl.Result{}, err
 	}
 
-	// Update status
-	lis.Status.Phase = "Running"
-	lis.Status.DeploymentName = deploymentName
-	lis.Status.ServiceName = serviceName
-	lis.Status.ReadyReplicas = lis.Spec.Scaling.Replicas
-	if err := r.Status().Update(ctx, &lis); err != nil {
+	if err := r.updateStatus(ctx, &lis, deploymentName, serviceName); err != nil {
 		log.Error(err, "Failed to update status")
 		return ctrl.Result{}, err
 	}
 
-	log.Info("Successfully reconciled LocalInferenceService", "name", lis.Name)
+	log.Info("Successfully reconciled LocalInferenceService", "name", lis.Name, "phase", lis.Status.Phase)
 	return ctrl.Result{}, nil
 }
 
-// getImageForRuntime returns the appropriate container image based on the runtime
-func (r *LocalInferenceServiceReconciler) getImageForRuntime(runtime string) string {
-	switch strings.ToLower(runtime) {
-	case "vllm":
-		return "local-vllm:latest"
-	case "sglang":
-		return "lmsysorg/sglang:latest"
-	default:
-		return "local-vllm:latest" // Default to vLLM
+// imageForRuntime resolves public runtime images, overridable per environment.
+func imageForRuntime(runtimeName string) string {
+	if strings.ToLower(runtimeName) == "sglang" {
+		if image := os.Getenv("RELATED_IMAGE_SGLANG"); image != "" {
+			return image
+		}
+		return defaultSGLangImage
 	}
+	if image := os.Getenv("RELATED_IMAGE_VLLM"); image != "" {
+		return image
+	}
+	return defaultVLLMImage
 }
 
-// buildEnvVars constructs environment variables from the spec
-func (r *LocalInferenceServiceReconciler) buildEnvVars(spec *servingv1.LocalInferenceServiceSpec) []corev1.EnvVar {
-	envVars := []corev1.EnvVar{
-		{
-			Name:  "MODEL_URI",
-			Value: spec.Model.URI,
-		},
+// commandForRuntime builds the serving command for the selected runtime. The two
+// runtimes take different flags, so the command has to follow the runtime.
+func commandForRuntime(runtimeName string, spec servingv1.LocalInferenceServiceSpec) []string {
+	dtype := mapPrecision(spec.Settings.Precision)
+
+	if strings.ToLower(runtimeName) == "sglang" {
+		args := []string{
+			"python", "-m", "sglang.launch_server",
+			"--model-path", spec.Model.URI,
+			"--host", "0.0.0.0",
+			"--port", fmt.Sprint(inferencePort),
+			"--dtype", dtype,
+			"--mem-fraction-static", "0.9",
+		}
+		if spec.Settings.BatchSize > 0 {
+			args = append(args, "--max-running-requests", fmt.Sprint(spec.Settings.BatchSize))
+		}
+		return args
 	}
 
-	if spec.Model.Name != "" {
-		envVars = append(envVars, corev1.EnvVar{
-			Name:  "MODEL_NAME",
-			Value: spec.Model.Name,
-		})
-	}
-
-	return envVars
-}
-
-// buildCommand constructs the command array based on runtime
-func (r *LocalInferenceServiceReconciler) buildCommand(runtime string, spec servingv1.LocalInferenceServiceSpec) []string {
-	return []string{
-		"python", "-m", "sglang.launch_server",
-		"--model", spec.Model.URI,
-		"--mem-fraction", "0.8",
-		"--dtype", r.mapPrecision(spec.Settings.Precision),
-		"--attention-backend", "flashinfer",
+	args := []string{
+		"vllm", "serve", spec.Model.URI,
 		"--host", "0.0.0.0",
-		"--port", "8000",
+		"--port", fmt.Sprint(inferencePort),
+		"--dtype", dtype,
+		"--gpu-memory-utilization", "0.9",
 	}
+	if spec.Settings.BatchSize > 0 {
+		args = append(args, "--max-num-seqs", fmt.Sprint(spec.Settings.BatchSize))
+	}
+	return args
 }
 
-// mapPrecision maps CRD precision to vLLM dtype
-func (r *LocalInferenceServiceReconciler) mapPrecision(precision string) string {
+func mapPrecision(precision string) string {
 	switch precision {
 	case "fp16":
 		return "float16"
@@ -177,51 +154,91 @@ func (r *LocalInferenceServiceReconciler) mapPrecision(precision string) string 
 	}
 }
 
-// ensureDeployment creates or updates the Deployment for the inference service
-func (r *LocalInferenceServiceReconciler) ensureDeployment(ctx context.Context, lis *servingv1.LocalInferenceService, name, image string, envVars []corev1.EnvVar) error {
+// replicasFor defaults to one replica when the CRD default has not been applied,
+// which is the case in unit tests that bypass the API server.
+func replicasFor(spec *servingv1.LocalInferenceServiceSpec) int32 {
+	if spec.Scaling.Replicas > 0 {
+		return spec.Scaling.Replicas
+	}
+	return 1
+}
+
+// memoryLimitFor maps settings.gpuMemory onto the container memory limit.
+// Kubernetes schedules GPU count, not GPU memory, so this is the closest
+// schedulable signal for the requested model footprint.
+func memoryLimitFor(spec *servingv1.LocalInferenceServiceSpec) resource.Quantity {
+	if spec.Settings.GPUMemory != "" {
+		if quantity, err := resource.ParseQuantity(spec.Settings.GPUMemory); err == nil {
+			return quantity
+		}
+	}
+	return resource.MustParse("8Gi")
+}
+
+func resourcesFor(spec *servingv1.LocalInferenceServiceSpec) corev1.ResourceRequirements {
+	return corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{
+			corev1.ResourceCPU:    resource.MustParse("1"),
+			corev1.ResourceMemory: resource.MustParse("4Gi"),
+			gpuResourceName:       resource.MustParse("1"),
+		},
+		Limits: corev1.ResourceList{
+			corev1.ResourceCPU:    resource.MustParse("2"),
+			corev1.ResourceMemory: memoryLimitFor(spec),
+			gpuResourceName:       resource.MustParse("1"),
+		},
+	}
+}
+
+func buildEnvVars(spec *servingv1.LocalInferenceServiceSpec) []corev1.EnvVar {
+	envVars := []corev1.EnvVar{{Name: "MODEL_URI", Value: spec.Model.URI}}
+	if spec.Model.Name != "" {
+		envVars = append(envVars, corev1.EnvVar{Name: "MODEL_NAME", Value: spec.Model.Name})
+	}
+	return envVars
+}
+
+func healthProbe(initialDelay int32) *corev1.Probe {
+	return &corev1.Probe{
+		ProbeHandler: corev1.ProbeHandler{
+			HTTPGet: &corev1.HTTPGetAction{
+				Path: "/health",
+				Port: intstr.FromInt32(inferencePort),
+			},
+		},
+		InitialDelaySeconds: initialDelay,
+		PeriodSeconds:       10,
+		FailureThreshold:    3,
+	}
+}
+
+func selectorLabels(name string) map[string]string {
+	return map[string]string{"app": name}
+}
+
+func (r *LocalInferenceServiceReconciler) ensureDeployment(ctx context.Context, lis *servingv1.LocalInferenceService, name string) error {
+	replicas := replicasFor(&lis.Spec)
 	dep := &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
 			Namespace: lis.Namespace,
 		},
 		Spec: appsv1.DeploymentSpec{
-			Replicas: &lis.Spec.Scaling.Replicas,
-			Selector: &metav1.LabelSelector{
-				MatchLabels: map[string]string{
-					"app": lis.Name,
-				},
-			},
+			Replicas: &replicas,
+			Selector: &metav1.LabelSelector{MatchLabels: selectorLabels(lis.Name)},
 			Template: corev1.PodTemplateSpec{
-				ObjectMeta: metav1.ObjectMeta{
-					Labels: map[string]string{
-						"app": lis.Name,
-					},
-				},
+				ObjectMeta: metav1.ObjectMeta{Labels: selectorLabels(lis.Name)},
 				Spec: corev1.PodSpec{
 					Containers: []corev1.Container{
 						{
-							Name:  "inference",
-							Image: image,
-							Ports: []corev1.ContainerPort{
-								{
-									ContainerPort: 8000,
-									Protocol:      corev1.ProtocolTCP,
-								},
-							},
-							Env:     envVars,
-							Command: r.buildCommand(lis.Spec.Runtime, lis.Spec),
-							Resources: corev1.ResourceRequirements{
-								Requests: corev1.ResourceList{
-									corev1.ResourceCPU:    resource.MustParse("1"),
-									corev1.ResourceMemory: resource.MustParse("4Gi"),
-									"nvidia.com/gpu":      resource.MustParse("1"),
-								},
-								Limits: corev1.ResourceList{
-									corev1.ResourceCPU:    resource.MustParse("2"),
-									corev1.ResourceMemory: resource.MustParse("8Gi"),
-									"nvidia.com/gpu":      resource.MustParse("1"),
-								},
-							},
+							Name:           "inference",
+							Image:          imageForRuntime(lis.Spec.Runtime),
+							Command:        commandForRuntime(lis.Spec.Runtime, lis.Spec),
+							Env:            buildEnvVars(&lis.Spec),
+							Ports:          []corev1.ContainerPort{{ContainerPort: inferencePort, Protocol: corev1.ProtocolTCP}},
+							Resources:      resourcesFor(&lis.Spec),
+							ReadinessProbe: healthProbe(10),
+							LivenessProbe:  healthProbe(30),
 						},
 					},
 				},
@@ -229,25 +246,81 @@ func (r *LocalInferenceServiceReconciler) ensureDeployment(ctx context.Context, 
 		},
 	}
 
-	// Try to create; if it exists, update
-	if err := r.Create(ctx, dep); err != nil {
-		if errors.IsAlreadyExists(err) {
-			// Update existing deployment
-			existing := &appsv1.Deployment{}
-			if err := r.Get(ctx, client.ObjectKeyFromObject(dep), existing); err != nil {
-				return err
-			}
-			existing.Spec = dep.Spec
-			return r.Update(ctx, existing)
-		}
+	if err := controllerutil.SetControllerReference(lis, dep, r.Scheme); err != nil {
 		return err
+	}
+
+	if err := r.Create(ctx, dep); err != nil {
+		if !apierrors.IsAlreadyExists(err) {
+			return err
+		}
+		existing := &appsv1.Deployment{}
+		if err := r.Get(ctx, client.ObjectKeyFromObject(dep), existing); err != nil {
+			return err
+		}
+		existing.Spec = dep.Spec
+		if err := controllerutil.SetControllerReference(lis, existing, r.Scheme); err != nil {
+			return err
+		}
+		return r.Update(ctx, existing)
 	}
 	return nil
 }
 
-// ensureHPA creates or updates the HorizontalPodAutoscaler for auto-scaling
+func (r *LocalInferenceServiceReconciler) ensureService(ctx context.Context, lis *servingv1.LocalInferenceService, name string) error {
+	svc := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: lis.Namespace,
+		},
+		Spec: corev1.ServiceSpec{
+			Selector: selectorLabels(lis.Name),
+			Ports: []corev1.ServicePort{
+				{
+					Name:       "http",
+					Port:       80,
+					TargetPort: intstr.FromInt32(inferencePort),
+					Protocol:   corev1.ProtocolTCP,
+				},
+			},
+			Type: corev1.ServiceTypeClusterIP,
+		},
+	}
+
+	if err := controllerutil.SetControllerReference(lis, svc, r.Scheme); err != nil {
+		return err
+	}
+
+	if err := r.Create(ctx, svc); err != nil {
+		if !apierrors.IsAlreadyExists(err) {
+			return err
+		}
+		existing := &corev1.Service{}
+		if err := r.Get(ctx, client.ObjectKeyFromObject(svc), existing); err != nil {
+			return err
+		}
+		existing.Spec = svc.Spec
+		if err := controllerutil.SetControllerReference(lis, existing, r.Scheme); err != nil {
+			return err
+		}
+		return r.Update(ctx, existing)
+	}
+	return nil
+}
+
 func (r *LocalInferenceServiceReconciler) ensureHPA(ctx context.Context, lis *servingv1.LocalInferenceService, name, deploymentName string) error {
-	defaultCPUUtilization := int32(70)
+	targetCPU := lis.Spec.Scaling.TargetCPU
+	if targetCPU <= 0 {
+		targetCPU = 70
+	}
+	minReplicas := lis.Spec.Scaling.MinReplicas
+	if minReplicas <= 0 {
+		minReplicas = 1
+	}
+	maxReplicas := lis.Spec.Scaling.MaxReplicas
+	if maxReplicas <= 0 {
+		maxReplicas = 10
+	}
 
 	hpa := &autoscalingv2.HorizontalPodAutoscaler{
 		ObjectMeta: metav1.ObjectMeta{
@@ -260,8 +333,8 @@ func (r *LocalInferenceServiceReconciler) ensureHPA(ctx context.Context, lis *se
 				Kind:       "Deployment",
 				Name:       deploymentName,
 			},
-			MinReplicas: &lis.Spec.Scaling.MinReplicas,
-			MaxReplicas: lis.Spec.Scaling.MaxReplicas,
+			MinReplicas: &minReplicas,
+			MaxReplicas: maxReplicas,
 			Metrics: []autoscalingv2.MetricSpec{
 				{
 					Type: autoscalingv2.ResourceMetricSourceType,
@@ -269,7 +342,7 @@ func (r *LocalInferenceServiceReconciler) ensureHPA(ctx context.Context, lis *se
 						Name: corev1.ResourceCPU,
 						Target: autoscalingv2.MetricTarget{
 							Type:               autoscalingv2.UtilizationMetricType,
-							AverageUtilization: &defaultCPUUtilization,
+							AverageUtilization: &targetCPU,
 						},
 					},
 				},
@@ -277,63 +350,83 @@ func (r *LocalInferenceServiceReconciler) ensureHPA(ctx context.Context, lis *se
 		},
 	}
 
+	if err := controllerutil.SetControllerReference(lis, hpa, r.Scheme); err != nil {
+		return err
+	}
+
 	if err := r.Create(ctx, hpa); err != nil {
-		if errors.IsAlreadyExists(err) {
-			existing := &autoscalingv2.HorizontalPodAutoscaler{}
-			if err := r.Get(ctx, client.ObjectKeyFromObject(hpa), existing); err != nil {
-				return err
-			}
-			existing.Spec = hpa.Spec
-			return r.Update(ctx, existing)
+		if !apierrors.IsAlreadyExists(err) {
+			return err
 		}
-		return err
+		existing := &autoscalingv2.HorizontalPodAutoscaler{}
+		if err := r.Get(ctx, client.ObjectKeyFromObject(hpa), existing); err != nil {
+			return err
+		}
+		existing.Spec = hpa.Spec
+		if err := controllerutil.SetControllerReference(lis, existing, r.Scheme); err != nil {
+			return err
+		}
+		return r.Update(ctx, existing)
 	}
 	return nil
 }
 
-// ensureService creates or updates the Service for the inference service
-func (r *LocalInferenceServiceReconciler) ensureService(ctx context.Context, lis *servingv1.LocalInferenceService, name, deploymentName string) error {
-	svc := &corev1.Service{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      name,
-			Namespace: lis.Namespace,
-		},
-		Spec: corev1.ServiceSpec{
-			Selector: map[string]string{
-				"app": lis.Name,
-			},
-			Ports: []corev1.ServicePort{
-				{
-					Name:       "http",
-					Port:       80,
-					TargetPort: intstr.FromInt(8000),
-					Protocol:   corev1.ProtocolTCP,
-				},
-			},
-			Type: corev1.ServiceTypeClusterIP,
-		},
+// deleteHPAIfPresent removes a leftover HPA when autoscaling is turned off.
+func (r *LocalInferenceServiceReconciler) deleteHPAIfPresent(ctx context.Context, name, namespace string) error {
+	existing := &autoscalingv2.HorizontalPodAutoscaler{}
+	err := r.Get(ctx, types.NamespacedName{Name: name, Namespace: namespace}, existing)
+	if apierrors.IsNotFound(err) {
+		return nil
 	}
-
-	// Try to create; if it exists, update
-	if err := r.Create(ctx, svc); err != nil {
-		if errors.IsAlreadyExists(err) {
-			// Update existing service
-			existing := &corev1.Service{}
-			if err := r.Get(ctx, client.ObjectKeyFromObject(svc), existing); err != nil {
-				return err
-			}
-			existing.Spec = svc.Spec
-			return r.Update(ctx, existing)
-		}
+	if err != nil {
 		return err
 	}
-	return nil
+	return r.Delete(ctx, existing)
 }
 
-// SetupWithManager sets up the controller with the Manager.
+// updateStatus reports the real Deployment state instead of assuming readiness.
+func (r *LocalInferenceServiceReconciler) updateStatus(ctx context.Context, lis *servingv1.LocalInferenceService, deploymentName, serviceName string) error {
+	desired := replicasFor(&lis.Spec)
+	phase := "Progressing"
+	available := metav1.ConditionFalse
+	reason := "DeploymentNotReady"
+	message := "Waiting for the inference Deployment to become ready"
+
+	dep := &appsv1.Deployment{}
+	err := r.Get(ctx, types.NamespacedName{Name: deploymentName, Namespace: lis.Namespace}, dep)
+	if err == nil {
+		lis.Status.ReadyReplicas = dep.Status.ReadyReplicas
+		if dep.Status.ObservedGeneration >= dep.Generation && dep.Status.ReadyReplicas >= desired {
+			phase = "Ready"
+			available = metav1.ConditionTrue
+			reason = "DeploymentReady"
+			message = "The inference Deployment is serving"
+		}
+	} else if !apierrors.IsNotFound(err) {
+		return err
+	}
+
+	lis.Status.Phase = phase
+	lis.Status.DeploymentName = deploymentName
+	lis.Status.ServiceName = serviceName
+
+	meta.SetStatusCondition(&lis.Status.Conditions, metav1.Condition{
+		Type:               "Available",
+		Status:             available,
+		Reason:             reason,
+		Message:            message,
+		ObservedGeneration: lis.Generation,
+	})
+
+	return r.Status().Update(ctx, lis)
+}
+
 func (r *LocalInferenceServiceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&servingv1.LocalInferenceService{}).
+		Owns(&appsv1.Deployment{}).
+		Owns(&corev1.Service{}).
+		Owns(&autoscalingv2.HorizontalPodAutoscaler{}).
 		Named("localinferenceservice").
 		Complete(r)
 }

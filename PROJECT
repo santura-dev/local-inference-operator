@@ -7,7 +7,7 @@ domain: local-ome.com
 layout:
 - go.kubebuilder.io/v4
 projectName: local-ome
-repo: local-ome
+repo: github.com/santura-dev/local-inference-operator
 resources:
 - api:
     crdVersion: v1
