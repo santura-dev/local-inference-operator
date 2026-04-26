@@ -1,145 +1,100 @@
-# Local Inference Operator
+# local-inference-operator
 
-Kubernetes operator for declarative deployment and management of local LLM inference services using vLLM and SGLang.
+![Go](https://img.shields.io/badge/go-%2300ADD8.svg?style=flat&logo=go&logoColor=white) ![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg) ![Kubernetes](https://img.shields.io/badge/kubernetes-compatible-blue?logo=kubernetes)
 
-## Description
+Kubernetes operator for local LLM inference. Declarative deployment via CRDs, GPU scheduling, node affinity, health checks.
 
-The Local Inference Operator simplifies LLM deployment on Kubernetes by providing a declarative API for model serving. It automates the creation of optimized inference pipelines with GPU resource management, multi-runtime support, and production monitoring.
+## The problem
 
-## Features
+Deploying one LLM on Kubernetes is easy. Deploying ten, across different GPU types, with health checks and auto-restart, is where it gets messy. Each model needs a Deployment, a Service, GPU resource requests, node affinity for GPU nodes, and a health check that knows whether the model is actually serving, not just whether the pod is running.
 
-- **Declarative API**: CRD-based model deployment specifications
-- **Multi-Runtime Support**: vLLM and SGLang runtimes
-- **GPU Resource Management**: Automatic GPU allocation and monitoring
-- **Auto-Scaling**: Dynamic pod scaling based on load
-- **Health Monitoring**: Built-in health checks and status reporting
+## The idea
 
-## Getting Started
+A `LocalInferenceService` CRD that abstracts all of that. You declare what model, what runtime (vLLM or SGLang), how many replicas. The operator creates and owns the Deployment and Service, wires up health probes, requests GPUs, and reports real readiness back on the resource.
 
-### Prerequisites
-- Kubernetes cluster with GPU support
-- NVIDIA GPU Operator installed
-- kubectl configured
-- Go 1.19+ (for development)
+## CRD
 
-### Installation
-
-**Install the CRDs:**
-```bash
-kubectl apply -f config/crd/
-```
-
-**Install RBAC:**
-```bash
-kubectl apply -f config/rbac/
-```
-
-**Deploy the operator:**
-```bash
-kubectl apply -f config/manager/
-```
-
-**Verify installation:**
-```bash
-kubectl get pods -n local-ome-system
-```
-
-### Usage
-
-**Create a model service:**
 ```yaml
 apiVersion: serving.local-ome.com/v1
 kind: LocalInferenceService
 metadata:
-  name: phi-service
+  name: qwen-7b
 spec:
-  runtime: sglang
-  model: microsoft/phi-1_5
+  runtime: vllm
+  model:
+    uri: "Qwen/Qwen2.5-7B-Instruct"
+    name: "Qwen 2.5 7B"
   settings:
-    gpuMemoryUtilization: 0.8
-    maxNumSeqs: 64
-    maxModelLen: 2048
+    batchSize: 4
+    precision: fp16
+    maxTokens: 512
+    gpuMemory: 24Gi
+  scaling:
+    replicas: 1
 ```
 
+## Install
+
+Requires a Kubernetes cluster with GPU nodes and `kubectl` pointed at it.
+
 ```bash
-kubectl apply -f phi-service.yaml
+make install   # install the CRDs
+make deploy    # deploy the controller manager
 ```
 
-**Check status:**
+For local development:
+
 ```bash
+make run       # run the controller against the current kubeconfig
+```
+
+Apply a sample:
+
+```bash
+kubectl apply -f config/samples/localinferenceservice.yaml
 kubectl get localinferenceservices
-kubectl describe localinferenceservice phi-service
 ```
 
-**Access the service:**
-```bash
-kubectl get svc
-curl http://service-endpoint/v1/completions \
-  -H "Content-Type: application/json" \
-  -d '{"model": "microsoft/phi-1_5", "prompt": "Hello"}'
-```
+## What it does
 
-### Supported Runtimes
+- **declarative deployment**: model deployments as CRDs. `kubectl get localinferenceservices` shows what is running.
+- **runtime-specific wiring**: vLLM services start with `vllm serve`, SGLang services with `sglang.launch_server`, each with the right flags for that runtime.
+- **GPU scheduling**: every inference container requests and limits `nvidia.com/gpu`. `settings.gpuMemory` maps onto the container memory limit, since Kubernetes schedules GPU count rather than GPU memory.
+- **health checks**: readiness and liveness probes hit `/health`, so a pod that loaded a model but cannot serve yet stays out of the Service.
+- **autoscaling**: set `scaling.autoScale: true` to create a CPU-targeted HPA. Turning it off deletes the HPA again.
+- **garbage collection**: created Deployments and Services carry an owner reference, so deleting the CR removes them.
+- **real status**: `status.phase`, `status.readyReplicas`, and an `Available` condition reflect the actual Deployment state.
 
-**SGLang:**
-- Optimized for long-context inference
-- FlashAttention integration
-- RadixAttention for memory efficiency
+## Configuration
 
-**vLLM:**
-- PagedAttention for memory management
-- Continuous batching
-- Extensive model support
+| field | default | description |
+|---|---|---|
+| `runtime` | required | `vllm` or `sglang` |
+| `model.uri` | required | model identifier passed to the runtime |
+| `settings.precision` | `fp16` | `fp16`, `fp32`, or `int8` |
+| `settings.batchSize` | `1` | mapped to `--max-num-seqs` (vLLM) or `--max-running-requests` (SGLang) |
+| `settings.maxTokens` | `100` | request-time generation limit, recorded on the CRD only |
+| `settings.gpuMemory` | `8Gi` | container memory limit in Kubernetes quantity form |
+| `scaling.replicas` | `1` | number of pods |
+| `scaling.autoScale` | `false` | create an HPA |
+| `scaling.minReplicas` / `maxReplicas` | `1` / `10` | HPA bounds |
+| `scaling.targetCPU` | `70` | HPA CPU target percentage |
+
+Runtime images default to `vllm/vllm-openai:latest` and `lmsysorg/sglang:latest`, and can be pinned per environment with `RELATED_IMAGE_VLLM` and `RELATED_IMAGE_SGLANG`.
 
 ## Development
 
-### Prerequisites
-- Go 1.19+
-- Kubebuilder 3.7+
-- Docker
-
-### Build and Test
 ```bash
-make generate
-make build
-make test
-make docker-build
+make test      # envtest suite + unit tests
+make build     # build the manager binary
+make manifests # regenerate CRDs and RBAC
+make generate  # regenerate deepcopy code
 ```
 
-### Local Development
-```bash
-make run
-```
+## Related
 
-## Troubleshooting
-
-**Pods not starting:**
-```bash
-kubectl describe pod <pod-name>
-kubectl logs <pod-name>
-```
-
-**GPU allocation failures:**
-```bash
-kubectl get nodes -o yaml | grep nvidia
-```
-
-## Contributing
-
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Add tests
-5. Update documentation
-6. Submit a pull request
+- [inference-operator-tui](https://github.com/santura-dev/inference-operator-tui) - terminal UI for managing these CRDs
 
 ## License
 
-MIT License - see LICENSE file for details
-
-## Related Projects
-
-- [operator-tui](https://github.com/yourusername/operator-tui) - Management interface
-- [vllm-tui](https://github.com/yourusername/vllm-tui) - Chat interface
-- [kubectl-tui](https://github.com/yourusername/kubectl-tui) - kubectl interface
-
+MIT
