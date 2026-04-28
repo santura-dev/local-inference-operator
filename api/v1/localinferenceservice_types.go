@@ -7,9 +7,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-// EDIT THIS FILE!  THIS IS SCAFFOLDING FOR YOU TO OWN!
-// NOTE: json tags are required.  Any new fields you add must have json tags for the fields to be serialized.
-
 // LocalInferenceServiceSpec defines the desired state of LocalInferenceService
 type LocalInferenceServiceSpec struct {
 	// Runtime specifies the inference runtime (e.g., "vllm" or "sglang")
@@ -94,9 +91,6 @@ type ScalingSpec struct {
 
 // LocalInferenceServiceStatus defines the observed state of LocalInferenceService.
 type LocalInferenceServiceStatus struct {
-	// INSERT ADDITIONAL STATUS FIELD - define observed state of cluster
-	// Important: Run "make" to regenerate code after modifying this file
-
 	// For Kubernetes API conventions, see:
 	// https://github.com/kubernetes/community/blob/master/contributors/devel/sig-architecture/api-conventions.md#typical-status-properties
 
